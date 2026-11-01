@@ -1,0 +1,2237 @@
+' PostgreSQL backend for the stdlib's abstract Database base class.
+'
+' PgDatabase/PgRowSet implement the six-primitive Database contract, so every
+' inherited helper (Query Of T, Insert, Update, transactions, *Async mirrors)
+' works unchanged. On top of that contract this module adds what the bundled
+' `postgres` package leaves out:
+'
+' - Real parameter binding. Values travel out of band through PQexecParams;
+'   they are never spliced into the SQL text. `?` placeholders are rewritten
+'   to `$1..$n` (skipping string literals, quoted identifiers, comments and
+'   dollar-quoted bodies); `??` is a literal `?` for the jsonb operators.
+' - Lossless values. Doubles are sent with round-trip precision, bytea
+'   travels as binary, and numeric/timestamp/uuid/json text is available
+'   exactly through PgRowSet.ValueText.
+' - Streaming cursors (QueryStream) built on libpq's chunked-rows mode.
+' - Prepared statements (Prepare -> PgStatement), LISTEN/NOTIFY, COPY in and
+'   out, large objects, cancellation, and PgException with SQLSTATE fields.
+'
+' Buoy's FFI has no array marshaling, so the C arrays PQexecParams takes
+' (char**, int*, Oid*) are assembled byte by byte in Bytes buffers. Every
+' supported target is little-endian with 8-byte pointers.
+
+' ── libpq FFI (private to this module) ─────────────────────────────────────
+
+Const CONNECTION_OK = 0
+
+Const PGRES_EMPTY_QUERY  = 0
+Const PGRES_COMMAND_OK   = 1
+Const PGRES_TUPLES_OK    = 2
+Const PGRES_COPY_OUT     = 3
+Const PGRES_COPY_IN      = 4
+Const PGRES_TUPLES_CHUNK = 12
+
+Const PQTRANS_IDLE    = 0
+Const PQTRANS_ACTIVE  = 1
+Const PQTRANS_INTRANS = 2
+Const PQTRANS_INERROR = 3
+
+Const INV_WRITE = 131072
+Const INV_READ  = 262144
+
+' Field codes for PQresultErrorField (postgres_ext.h PG_DIAG_*).
+Const PG_DIAG_SEVERITY_NONLOCALIZED        = 86
+Const PG_DIAG_SQLSTATE        = 67
+Const PG_DIAG_MESSAGE_PRIMARY = 77
+Const PG_DIAG_MESSAGE_DETAIL  = 68
+Const PG_DIAG_MESSAGE_HINT    = 72
+Const PG_DIAG_POSITION        = 80
+Const PG_DIAG_SCHEMA_NAME     = 115
+Const PG_DIAG_TABLE_NAME      = 116
+Const PG_DIAG_COLUMN_NAME     = 99
+Const PG_DIAG_CONSTRAINT_NAME = 110
+
+Const PG_COPY_CHUNK = 1048576
+Const PG_LO_CHUNK   = 262144
+
+Declare Function PQconnectdb Lib "pq" (conninfo As String) As Ptr
+Declare Function PQstatus Lib "pq" (conn As Ptr) As Int32
+Declare Function PQerrorMessage Lib "pq" (conn As Ptr) As String
+Declare Sub PQfinish Lib "pq" (conn As Ptr)
+Declare Sub PQreset Lib "pq" (conn As Ptr)
+Declare Function PQexec Lib "pq" (conn As Ptr, query As String) As Ptr
+Declare Function PQexecParams Lib "pq" (conn As Ptr, command As String, nParams As Int32, _
+    paramTypes As Ptr, paramValues As Ptr, paramLengths As Ptr, paramFormats As Ptr, _
+    resultFormat As Int32) As Ptr
+Declare Function PQprepare Lib "pq" (conn As Ptr, stmtName As String, query As String, _
+    nParams As Int32, paramTypes As Ptr) As Ptr
+Declare Function PQexecPrepared Lib "pq" (conn As Ptr, stmtName As String, nParams As Int32, _
+    paramValues As Ptr, paramLengths As Ptr, paramFormats As Ptr, resultFormat As Int32) As Ptr
+Declare Function PQclosePrepared Lib "pq" (conn As Ptr, stmtName As String) As Ptr
+Declare Function PQsendQueryParams Lib "pq" (conn As Ptr, command As String, nParams As Int32, _
+    paramTypes As Ptr, paramValues As Ptr, paramLengths As Ptr, paramFormats As Ptr, _
+    resultFormat As Int32) As Int32
+Declare Function PQsendQueryPrepared Lib "pq" (conn As Ptr, stmtName As String, nParams As Int32, _
+    paramValues As Ptr, paramLengths As Ptr, paramFormats As Ptr, resultFormat As Int32) As Int32
+Declare Function PQsetChunkedRowsMode Lib "pq" (conn As Ptr, chunkSize As Int32) As Int32
+Declare Function PQgetResult Lib "pq" (conn As Ptr) As Ptr
+Declare Function PQresultStatus Lib "pq" (res As Ptr) As Int32
+Declare Function PQresultErrorMessage Lib "pq" (res As Ptr) As String
+Declare Function PQresultErrorField Lib "pq" (res As Ptr, fieldcode As Int32) As Ptr
+Declare Sub PQclear Lib "pq" (res As Ptr)
+Declare Function PQntuples Lib "pq" (res As Ptr) As Int32
+Declare Function PQnfields Lib "pq" (res As Ptr) As Int32
+Declare Function PQfname Lib "pq" (res As Ptr, col As Int32) As String
+Declare Function PQftype Lib "pq" (res As Ptr, col As Int32) As UInt32
+Declare Function PQgetvalue Lib "pq" (res As Ptr, row As Int32, col As Int32) As String
+Declare Function PQgetvalueRaw Lib "pq" Alias "PQgetvalue" (res As Ptr, row As Int32, col As Int32) As Ptr
+Declare Function PQgetlength Lib "pq" (res As Ptr, row As Int32, col As Int32) As Int32
+Declare Function PQgetisnull Lib "pq" (res As Ptr, row As Int32, col As Int32) As Int32
+Declare Function PQcmdTuples Lib "pq" (res As Ptr) As String
+Declare Function PQcmdStatus Lib "pq" (res As Ptr) As String
+Declare Function PQescapeIdentifier Lib "pq" (conn As Ptr, str As String, length As Integer) As Ptr
+Declare Function PQescapeLiteral Lib "pq" (conn As Ptr, str As String, length As Integer) As Ptr
+Declare Sub PQfreemem Lib "pq" (p As Ptr)
+Declare Function PQtransactionStatus Lib "pq" (conn As Ptr) As Int32
+Declare Function PQserverVersion Lib "pq" (conn As Ptr) As Int32
+Declare Function PQbackendPID Lib "pq" (conn As Ptr) As Int32
+Declare Function PQparameterStatus Lib "pq" (conn As Ptr, paramName As String) As Ptr
+Declare Function PQsocket Lib "pq" (conn As Ptr) As Int32
+Declare Function PQconsumeInput Lib "pq" (conn As Ptr) As Int32
+Declare Function PQnotifies Lib "pq" (conn As Ptr) As Ptr
+Declare Function PQputCopyData Lib "pq" (conn As Ptr, buffer As Ptr, nbytes As Int32) As Int32
+Declare Function PQputCopyEnd Lib "pq" (conn As Ptr, errormsg As Ptr) As Int32
+Declare Function PQputCopyEndWithError Lib "pq" Alias "PQputCopyEnd" (conn As Ptr, errormsg As String) As Int32
+Declare Function PQgetCopyData Lib "pq" (conn As Ptr, ByRef buffer As Ptr, isAsync As Int32) As Int32
+Declare Function PQcancelCreate Lib "pq" (conn As Ptr) As Ptr
+Declare Function PQcancelBlocking Lib "pq" (cancelConn As Ptr) As Int32
+Declare Sub PQcancelReset Lib "pq" (cancelConn As Ptr)
+Declare Sub PQcancelFinish Lib "pq" (cancelConn As Ptr)
+Declare Function lo_creat Lib "pq" (conn As Ptr, mode As Int32) As UInt32
+Declare Function lo_open Lib "pq" (conn As Ptr, lobjId As UInt32, mode As Int32) As Int32
+Declare Function lo_write Lib "pq" (conn As Ptr, fd As Int32, buf As Ptr, length As Integer) As Int32
+Declare Function lo_read Lib "pq" (conn As Ptr, fd As Int32, buf As Ptr, length As Integer) As Int32
+Declare Function lo_close Lib "pq" (conn As Ptr, fd As Int32) As Int32
+Declare Function lo_unlink Lib "pq" (conn As Ptr, lobjId As UInt32) As Int32
+Declare Function lo_truncate64 Lib "pq" (conn As Ptr, fd As Int32, length As Int64) As Int32
+
+' Socket wait for WaitForNotification, and round-trip Double formatting.
+' select(), not poll(): the toolchain's libc stubs don't export poll, and
+' ws2_32's stub has no WSAPoll (the stdlib's networking.bui makes the same
+' choice).
+#If TargetWindows Then
+Declare Function PgSelect Lib "ws2_32" Alias "select" (nfds As Int32, readfds As Ptr, _
+    writefds As Ptr, exceptfds As Ptr, timeout As Ptr) As Int32
+Declare Function PgFormatG Lib "msvcrt" Alias "sprintf" (buf As Ptr, fmt As String, ...) As Int32
+#Else
+Declare Function PgSelect Lib "c" Alias "select" (nfds As Int32, readfds As Ptr, _
+    writefds As Ptr, exceptfds As Ptr, timeout As Ptr) As Int32
+Declare Function PgFormatG Lib "c" Alias "sprintf" (buf As Ptr, fmt As String, ...) As Int32
+#End If
+
+''' Blocks until `socket` is readable or `timeoutMs` elapses (negative: no
+''' limit). The fd_set and timeval are laid out by hand for each platform.
+Private Sub PgWaitReadable(socket As Integer, timeoutMs As Integer)
+    Dim seconds As Integer = timeoutMs \ 1000
+    Dim micros As Integer = (timeoutMs Mod 1000) * 1000
+    Dim fds As New Bytes()
+    Dim tv As New Bytes()
+#If TargetWindows Then
+    ' fd_set { u_int fd_count; SOCKET fd_array[64]; }, timeval { long; long; }
+    PgPutInt(fds, 1, 8)
+    PgPutInt(fds, socket, 8)
+    PgPutInt(tv, seconds, 4)
+    PgPutInt(tv, micros, 4)
+#Else
+    ' A 1024-bit fd_set; bit fd lives at byte fd\8 on little-endian targets.
+    ' timeval is { time_t; suseconds_t; } padded to 16 bytes.
+    If socket >= 1024 Then
+        Thread.Sleep(10)
+        Return
+    End If
+    For i As Integer = 1 To 128
+        fds.Append(0)
+    Next
+    Dim bit As Integer = 1
+    For i As Integer = 1 To socket Mod 8
+        bit = bit * 2
+    Next
+    fds.SetItem(socket \ 8, bit)
+    PgPutInt(tv, seconds, 8)
+    PgPutInt(tv, micros, 8)
+#End If
+    Dim timeout As Ptr = Nil
+    If timeoutMs >= 0 Then
+        timeout = tv.DataPtr()
+    End If
+    PgSelect(socket + 1, fds.DataPtr(), Nil, Nil, timeout)
+End Sub
+
+' ── Public type constants ──────────────────────────────────────────────────
+
+''' Well-known PostgreSQL type OIDs, as reported by PgRowSet.ColumnTypeOid and
+''' accepted by PgParam.OfTyped.
+Public Class PgType
+    Public Const Bool As Integer = 16
+    Public Const Bytea As Integer = 17
+    Public Const Int8 As Integer = 20
+    Public Const Int2 As Integer = 21
+    Public Const Int4 As Integer = 23
+    Public Const Text As Integer = 25
+    Public Const Oid As Integer = 26
+    Public Const Json As Integer = 114
+    Public Const Float4 As Integer = 700
+    Public Const Float8 As Integer = 701
+    Public Const Varchar As Integer = 1043
+    Public Const Date As Integer = 1082
+    Public Const Time As Integer = 1083
+    Public Const Timestamp As Integer = 1114
+    Public Const TimestampTz As Integer = 1184
+    Public Const Interval As Integer = 1186
+    Public Const Numeric As Integer = 1700
+    Public Const Uuid As Integer = 2950
+    Public Const Jsonb As Integer = 3802
+End Class
+
+' ── Byte-buffer and C-string helpers ───────────────────────────────────────
+
+''' Appends `v` to `b` as a little-endian two's-complement integer `width`
+''' bytes wide.
+Private Sub PgPutInt(b As Bytes, v As Integer, width As Integer)
+    Dim x As Integer = v
+    For i As Integer = 1 To width
+        Dim low As Integer = x And 255
+        b.Append(low)
+        ' Exact division (the low byte is removed first), so negative values
+        ' shift arithmetically instead of truncating toward zero.
+        x = (x - low) \ 256
+    Next
+End Sub
+
+''' Reads an unsigned little-endian integer `width` bytes wide (at most 7, or
+''' 8 for user-space addresses whose top byte is clear) starting at `offset`.
+Private Function PgGetInt(b As Bytes, offset As Integer, width As Integer) As Integer
+    Dim v As Integer = 0
+    For i As Integer = width - 1 To 0 Step -1
+        v = v * 256 + b.Item(offset + i)
+    Next
+    Return v
+End Function
+
+''' Copies a NUL-terminated C string libpq owns into a Buoy String; Nil → "".
+Private Function PgCopyCString(p As Ptr) As String
+    If p = Nil Then
+        Return ""
+    End If
+    Return CType(CType(p, CString), String)
+End Function
+
+Private Function PgOffsetPtr(base As Ptr, offset As Integer) As Ptr
+    Return CType(CType(base, Integer) + offset, Ptr)
+End Function
+
+Private Function PgUtf8Length(s As String) As Integer
+    Return Bytes.FromString(s, Text.Encodings.UTF8).Count
+End Function
+
+' ── Value encoding / decoding ──────────────────────────────────────────────
+
+''' The shortest decimal text that parses back to exactly `v`, in the forms
+''' PostgreSQL accepts for float8 (NaN, Infinity, -Infinity included). Str()
+''' keeps only six significant digits, which is why it is not used here.
+Private Function PgFormatDouble(v As Double) As String
+    If v <> v Then
+        Return "NaN"
+    End If
+    Dim spread As Double = v - v
+    If spread <> spread Then
+        If v > 0.0 Then
+            Return "Infinity"
+        End If
+        Return "-Infinity"
+    End If
+    Dim buf As New Bytes()
+    For i As Integer = 1 To 40
+        buf.Append(0)
+    Next
+    Dim valueText As String = ""
+    For Each fmt As String In ["%.15g", "%.16g", "%.17g"]
+        PgFormatG(buf.DataPtr(), fmt, v)
+        valueText = String.Replace(PgCopyCString(buf.DataPtr()), ",", ".")
+        If Double.Parse(valueText).Or(v + 1.0) = v Then
+            Return valueText
+        End If
+    Next
+    Return valueText
+End Function
+
+Private Function PgParseDouble(valueText As String) As Double
+    Return Double.Parse(valueText).Or(0.0)
+End Function
+
+''' Decodes bytea's text output (`\x` hex, or the legacy escape format).
+Private Function PgDecodeBytea(valueText As String) As Bytes
+    If String.StartsWith(valueText, "\\x", True) Then
+        Dim parsed As Result Of Bytes, String = Bytes.FromHex(String.Mid(valueText, 3))
+        If parsed.IsOk Then
+            Return parsed.Value
+        End If
+        Throw New DatabaseException("malformed bytea value")
+    End If
+    ' Escape format: \\ is a backslash, \ooo an octal byte, anything else literal.
+    Dim src As Bytes = Bytes.FromString(valueText, Text.Encodings.UTF8)
+    Dim outBytes As New Bytes()
+    Dim i As Integer = 0
+    While i < src.Count
+        Dim c As Integer = src.Item(i)
+        If c = 92 And i + 1 < src.Count And src.Item(i + 1) = 92 Then
+            outBytes.Append(92)
+            i += 2
+        ElseIf c = 92 And i + 3 < src.Count Then
+            outBytes.Append(((src.Item(i + 1) - 48) * 64 + (src.Item(i + 2) - 48) * 8 + (src.Item(i + 3) - 48)) And 255)
+            i += 4
+        Else
+            outBytes.Append(c)
+            i += 1
+        End If
+    Wend
+    Return outBytes
+End Function
+
+''' Reads a result column as a stdlib DbValue, dispatching on the server's
+''' column type. numeric maps to Double here (DbValue has no exact decimal);
+''' read it with PgRowSet.ValueText when every digit matters.
+Private Function PgReadColumn(res As Ptr, row As Integer, col As Integer) As DbValue
+    If PQgetisnull(res, row, col) <> 0 Then
+        Return DbValue.OfNull()
+    End If
+    Dim valueText As String = PQgetvalue(res, row, col)
+    Select Case PQftype(res, col)
+    Case PgType.Int2, PgType.Int4, PgType.Int8, PgType.Oid
+        Return DbValue.OfInteger(Integer.Parse(valueText).Or(0))
+    Case PgType.Float4, PgType.Float8, PgType.Numeric
+        Return DbValue.OfDouble(PgParseDouble(valueText))
+    Case PgType.Bool
+        Return DbValue.OfBoolean(valueText = "t")
+    Case Else
+        Return DbValue.OfString(valueText)
+    End Select
+End Function
+
+' ── SQL scanning ───────────────────────────────────────────────────────────
+
+Private Function PgIsIdentChar(ch As String) As Boolean
+    Dim c As Integer = String.Asc(ch)
+    If c >= 48 And c <= 57 Then
+        Return True
+    End If
+    If c >= 65 And c <= 90 Then
+        Return True
+    End If
+    If c >= 97 And c <= 122 Then
+        Return True
+    End If
+    Return c = 95 Or c > 127
+End Function
+
+Private Function PgIsDigit(ch As String) As Boolean
+    Dim c As Integer = String.Asc(ch)
+    Return c >= 48 And c <= 57
+End Function
+
+''' Scans one SQL string the way the server tokenizes it, skipping string
+''' literals (including E'' escapes and doubled quotes), quoted identifiers,
+''' line and nested block comments, and dollar-quoted bodies. Outside those
+''' it rewrites `??` to a literal `?` and, when `numberPlaceholders` is set,
+''' each remaining `?` to `$1`, `$2`, …. It also counts top-level statements
+''' and keeps the first statement's code (comments blanked) so the caller can
+''' tell what kind of statement it is.
+Private Class PgSqlScanner
+    Public Property Sql As String = ""
+    Public Property Placeholders As Integer = 0
+    Public Property UsesDollarParams As Boolean = False
+    Public Property Statements As Integer = 0
+    Public Property FirstStatement As String = ""
+    ''' Statements that are `COPY … FROM STDIN` / `COPY … TO STDOUT`.
+    Public Property CopyStatements As Integer = 0
+
+    Private Property mOut As Array Of String
+    Private Property mFirst As Array Of String
+    ''' The current statement's code with literals and comments blanked.
+    Private Property mBare As Array Of String
+    Private Property mHasCode As Boolean = False
+
+    Public Sub Constructor(sql As String, numberPlaceholders As Boolean)
+        Me.mOut = []
+        Me.mFirst = []
+        Me.mBare = []
+        Dim chars As Array Of String = String.Chars(sql)
+        Dim n As Integer = chars.Count
+        Dim i As Integer = 0
+        While i < n
+            Dim ch As String = chars(i)
+            Dim nextCh As String = ""
+            If i + 1 < n Then
+                nextCh = chars(i + 1)
+            End If
+            If ch = "'" Or ch = "\"" Then
+                ' E'…' strings honour backslash escapes; in every quoted form a
+                ' doubled quote character stays inside the token.
+                Dim escapes As Boolean = False
+                If ch = "'" And i > 0 Then
+                    If chars(i - 1) = "E" Or chars(i - 1) = "e" Then
+                        escapes = True
+                        If i > 1 Then
+                            escapes = Not PgIsIdentChar(chars(i - 2))
+                        End If
+                    End If
+                End If
+                Dim token As Array Of String = []
+                token.Append(ch)
+                i += 1
+                While i < n
+                    Dim c As String = chars(i)
+                    token.Append(c)
+                    i += 1
+                    If escapes And c = "\\" And i < n Then
+                        token.Append(chars(i))
+                        i += 1
+                    ElseIf c = ch Then
+                        If i < n And chars(i) = ch Then
+                            token.Append(ch)
+                            i += 1
+                        Else
+                            Exit While
+                        End If
+                    End If
+                Wend
+                Dim quoted As String = String.Join(token, "")
+                Me.EmitQuoted(quoted)
+            ElseIf ch = "-" And nextCh = "-" Then
+                Dim comment As Array Of String = []
+                While i < n
+                    Dim c As String = chars(i)
+                    comment.Append(c)
+                    i += 1
+                    If c = "\n" Or c = "\r" Then
+                        Exit While
+                    End If
+                Wend
+                Me.Emit(String.Join(comment, ""), " ")
+            ElseIf ch = "/" And nextCh = "*" Then
+                Dim comment As Array Of String = []
+                Dim depth As Integer = 0
+                While i < n
+                    Dim c As String = chars(i)
+                    Dim c2 As String = ""
+                    If i + 1 < n Then
+                        c2 = chars(i + 1)
+                    End If
+                    If c = "/" And c2 = "*" Then
+                        depth += 1
+                        comment.Append("/*")
+                        i += 2
+                    ElseIf c = "*" And c2 = "/" Then
+                        depth -= 1
+                        comment.Append("*/")
+                        i += 2
+                        If depth = 0 Then
+                            Exit While
+                        End If
+                    Else
+                        comment.Append(c)
+                        i += 1
+                    End If
+                Wend
+                Me.Emit(String.Join(comment, ""), " ")
+            ElseIf ch = "$" Then
+                ' $n is a positional parameter. A dollar-quote tag is $$ or
+                ' $ident$ (not starting with a digit); neither can follow an
+                ' identifier character.
+                Dim isTag As Boolean = False
+                Dim j As Integer = i + 1
+                If i = 0 Or Not PgIsIdentChar(chars(i - 1)) Then
+                    If j < n Then
+                        If PgIsDigit(chars(j)) Then
+                            Me.UsesDollarParams = True
+                        Else
+                            While j < n And chars(j) <> "$" And PgIsIdentChar(chars(j))
+                                j += 1
+                            Wend
+                            isTag = j < n And chars(j) = "$"
+                        End If
+                    End If
+                End If
+                If isTag Then
+                    Dim tagParts As Array Of String = []
+                    For k As Integer = i To j
+                        tagParts.Append(chars(k))
+                    Next
+                    Dim tag As String = String.Join(tagParts, "")
+                    Dim tagLen As Integer = tagParts.Count
+                    Dim body As Array Of String = []
+                    body.Append(tag)
+                    i = j + 1
+                    Dim closed As Boolean = False
+                    While i < n And Not closed
+                        If chars(i) = "$" And i + tagLen <= n Then
+                            Dim candidate As Array Of String = []
+                            For k As Integer = i To i + tagLen - 1
+                                candidate.Append(chars(k))
+                            Next
+                            If String.Compare(String.Join(candidate, ""), tag, True) = 0 Then
+                                body.Append(tag)
+                                i += tagLen
+                                closed = True
+                                Continue While
+                            End If
+                        End If
+                        body.Append(chars(i))
+                        i += 1
+                    Wend
+                    Dim dollarQuoted As String = String.Join(body, "")
+                    Me.EmitQuoted(dollarQuoted)
+                Else
+                    Me.Emit(ch, ch)
+                    i += 1
+                End If
+            ElseIf ch = "?" Then
+                If nextCh = "?" Then
+                    Me.Emit("?", "?")
+                    i += 2
+                ElseIf numberPlaceholders Then
+                    Me.Placeholders += 1
+                    Dim placeholder As String = "$" + Str(Me.Placeholders)
+                    Me.Emit(placeholder, placeholder)
+                    i += 1
+                Else
+                    Me.Emit(ch, ch)
+                    i += 1
+                End If
+            ElseIf ch = ";" Then
+                Me.mOut.Append(ch)
+                Me.EndStatement()
+                i += 1
+            Else
+                Me.Emit(ch, ch)
+                i += 1
+            End If
+        Wend
+        Me.EndStatement()
+        Me.Sql = String.Join(Me.mOut, "")
+        Me.FirstStatement = String.Trim(String.Join(Me.mFirst, ""))
+    End Sub
+
+    ''' Appends `text` to the rewritten SQL; `code` is what the server would
+    ''' see as code there (comments become a space).
+    Private Sub Emit(text As String, code As String)
+        Me.mOut.Append(text)
+        Me.mBare.Append(code)
+        Me.Track(code)
+    End Sub
+
+    ''' A string literal, quoted identifier or dollar-quoted body: code, but
+    ''' never a keyword.
+    Private Sub EmitQuoted(text As String)
+        Me.mOut.Append(text)
+        Me.mBare.Append(" @ ")
+        Me.Track(text)
+    End Sub
+
+    Private Sub Track(code As String)
+        If Me.Statements = 0 Then
+            Me.mFirst.Append(code)
+        End If
+        If Not Me.mHasCode And String.Trim(code) <> "" Then
+            Me.mHasCode = True
+        End If
+    End Sub
+
+    Private Sub EndStatement()
+        If Me.mHasCode Then
+            Me.Statements += 1
+            Dim bare As String = String.Trim(String.Join(Me.mBare, ""))
+            If String.Compare(String.Left(bare, 4), "COPY", False) = 0 And Not PgIsIdentChar(String.Mid(bare + " ", 5, 1)) Then
+                If PgProtocolCopy(bare) Then
+                    Me.CopyStatements += 1
+                End If
+            End If
+        End If
+        Me.mHasCode = False
+        Me.mBare = []
+    End Sub
+End Class
+
+' Only the top-level COPY direction can introduce a protocol endpoint.
+Private Function PgProtocolCopy(bare As String) As Boolean
+    Dim chars As Array Of String = String.Chars(bare)
+    Dim i As Integer = 0
+    Dim depth As Integer = 0
+    Dim direction As String = ""
+    While i < chars.Count
+        Dim ch As String = chars(i)
+        If PgIsIdentChar(ch) Then
+            Dim parts As Array Of String = []
+            While i < chars.Count And PgIsIdentChar(chars(i))
+                parts.Append(chars(i))
+                i += 1
+            Wend
+            Dim word As String = String.Join(parts, "")
+            If depth = 0 Then
+                If direction <> "" Then
+                    Return (String.Compare(direction, "FROM", False) = 0 And String.Compare(word, "STDIN", False) = 0) Or (String.Compare(direction, "TO", False) = 0 And String.Compare(word, "STDOUT", False) = 0)
+                End If
+                If String.Compare(word, "FROM", False) = 0 Or String.Compare(word, "TO", False) = 0 Then direction = word
+            End If
+            Continue While
+        End If
+        If String.Trim(ch) <> "" And direction <> "" Then Return False
+        If ch = "(" Then depth += 1
+        If ch = ")" Then depth -= 1
+        i += 1
+    Wend
+    Return False
+End Function
+
+''' Scans `sql` (see PgSqlScanner), rejecting a mix of `?` and `$n`
+''' placeholders, whose numbering would collide.
+Private Function PgScanSql(sql As String, numberPlaceholders As Boolean) As PgSqlScanner
+    Dim scan As New PgSqlScanner(sql, numberPlaceholders)
+    If scan.UsesDollarParams And scan.Placeholders > 0 Then
+        Throw New DatabaseException("SQL mixes ? and $n placeholders; use one style")
+    End If
+    Return scan
+End Function
+
+''' Rewrites each `?` placeholder to `$1`, `$2`, … and each `??` to a literal
+''' `?`, leaving string literals, quoted identifiers, comments and
+''' dollar-quoted bodies untouched. SQL already written with `$n`
+''' placeholders passes through; mixing the two styles throws.
+Public Function PgTranslatePlaceholders(sql As String) As String
+    Return PgScanSql(sql, True).Sql
+End Function
+
+''' True when `code` begins with the keyword `word` (any case) followed by a
+''' non-identifier character, so "DO" doesn't match "DOMAIN" or "DONE".
+Private Function PgStartsWithWord(code As String, word As String) As Boolean
+    If Not String.StartsWith(code, word) Then
+        Return False
+    End If
+    If String.Len(code) = String.Len(word) Then
+        Return True
+    End If
+    Return Not PgIsIdentChar(String.Mid(code, String.Len(word) + 1, 1))
+End Function
+
+''' The table an `INSERT INTO <table>` statement targets, exactly as written
+''' (quotes and schema included), or "" for any other statement. `code` is a
+''' statement with its comments already blanked (PgSqlScanner.FirstStatement).
+Private Function PgInsertTarget(code As String) As String
+    Dim s As String = String.Trim(code)
+    If Not PgStartsWithWord(s, "INSERT") Then
+        Return ""
+    End If
+    s = String.Trim(String.Mid(s, 7))
+    If Not PgStartsWithWord(s, "INTO") Then
+        Return ""
+    End If
+    Dim chars As Array Of String = String.Chars(String.Trim(String.Mid(s, 5)))
+    Dim parts As Array Of String = []
+    Dim inQuote As Boolean = False
+    For Each c As String In chars
+        If c = "\"" Then
+            inQuote = Not inQuote
+        ElseIf Not inQuote Then
+            If c = " " Or c = "(" Or c = "\t" Or c = "\n" Or c = "\r" Then
+                Exit For
+            End If
+        End If
+        parts.Append(c)
+    Next
+    Return String.Join(parts, "")
+End Function
+
+' ── Errors ─────────────────────────────────────────────────────────────────
+
+''' A server or client error with PostgreSQL's structured fields. Inherits
+''' DatabaseException, so code written against the stdlib Database surface
+''' still catches it. SqlState is the five-character SQLSTATE code (e.g.
+''' "23505" unique_violation, "57014" query_canceled); it is "" for
+''' client-side failures such as a refused connection.
+Public Class PgException Inherits DatabaseException
+    Public Property SqlState As String = ""
+    Public Property Severity As String = ""
+    Public Property Detail As String = ""
+    Public Property Hint As String = ""
+    ''' 1-based character position of the error in the statement, or 0.
+    Public Property Position As Integer = 0
+    Public Property SchemaName As String = ""
+    Public Property TableName As String = ""
+    Public Property ColumnName As String = ""
+    Public Property ConstraintName As String = ""
+
+    Public Sub Constructor(msg As String)
+        Super.Constructor(msg)
+    End Sub
+
+    ''' True for SQLSTATE class 23 (integrity constraint violations).
+    Public Function IsConstraintViolation() As Boolean
+        Return String.StartsWith(Me.SqlState, "23")
+    End Function
+
+    ''' True for serialization failures and deadlocks, which are safe to retry.
+    Public Function IsRetryable() As Boolean
+        Return Me.SqlState = "40001" Or Me.SqlState = "40P01"
+    End Function
+End Class
+
+Private Function PgErrorFromResult(res As Ptr, fallback As String) As PgException
+    Dim msg As String = ""
+    If res <> Nil Then
+        msg = String.Trim(PQresultErrorMessage(res))
+    End If
+    If msg = "" Then
+        msg = String.Trim(fallback)
+    End If
+    If msg = "" Then
+        msg = "PostgreSQL command failed"
+    End If
+    Dim e As New PgException(msg)
+    If res <> Nil Then
+        e.SqlState = PgCopyCString(PQresultErrorField(res, PG_DIAG_SQLSTATE))
+        e.Severity = PgCopyCString(PQresultErrorField(res, PG_DIAG_SEVERITY_NONLOCALIZED))
+        e.Detail = PgCopyCString(PQresultErrorField(res, PG_DIAG_MESSAGE_DETAIL))
+        e.Hint = PgCopyCString(PQresultErrorField(res, PG_DIAG_MESSAGE_HINT))
+        e.Position = Integer.Parse(PgCopyCString(PQresultErrorField(res, PG_DIAG_POSITION))).Or(0)
+        e.SchemaName = PgCopyCString(PQresultErrorField(res, PG_DIAG_SCHEMA_NAME))
+        e.TableName = PgCopyCString(PQresultErrorField(res, PG_DIAG_TABLE_NAME))
+        e.ColumnName = PgCopyCString(PQresultErrorField(res, PG_DIAG_COLUMN_NAME))
+        e.ConstraintName = PgCopyCString(PQresultErrorField(res, PG_DIAG_CONSTRAINT_NAME))
+    End If
+    Return e
+End Function
+
+''' Takes a connection out of COPY mode after a COPY statement arrived through
+''' a call that doesn't carry COPY data, then drains its remaining results.
+''' While libpq is in COPY state PQgetResult keeps returning the COPY result,
+''' so each COPY met while draining (a later statement in the same string)
+''' is ended in turn rather than cleared, which would spin forever.
+Private Sub PgAbortCopy(conn As Ptr, status As Integer)
+    Dim current As Integer = status
+    While current = PGRES_COPY_IN Or current = PGRES_COPY_OUT
+        If current = PGRES_COPY_IN Then
+            PQputCopyEndWithError(conn, "COPY FROM STDIN must be run with PgDatabase.CopyFrom")
+        Else
+            Dim buffer As Ptr = Nil
+            Dim n As Integer = PQgetCopyData(conn, buffer, 0)
+            While n > 0
+                PQfreemem(buffer)
+                buffer = Nil
+                n = PQgetCopyData(conn, buffer, 0)
+            Wend
+        End If
+        current = -1
+        Dim res As Ptr = PQgetResult(conn)
+        While res <> Nil
+            Dim st As Integer = PQresultStatus(res)
+            PQclear(res)
+            If st = PGRES_COPY_IN Or st = PGRES_COPY_OUT Then
+                current = st
+                Exit While
+            End If
+            res = PQgetResult(conn)
+        Wend
+    Wend
+End Sub
+
+Private Function PgCopyMisuse(status As Integer) As DatabaseException
+    If status = PGRES_COPY_IN Then
+        Return New DatabaseException("use PgDatabase.CopyFrom for COPY ... FROM STDIN")
+    End If
+    Return New DatabaseException("use PgDatabase.CopyTo for COPY ... TO STDOUT")
+End Function
+
+' ── Parameters ─────────────────────────────────────────────────────────────
+
+''' One bound parameter value, typed the way PostgreSQL types the equivalent
+''' literal so it resolves exactly as written-out SQL would: an Integer is
+''' int4 (int8 beyond that range, like `42` vs `9999999999`), a Double is
+''' numeric (like `2.5`; NaN and ±Infinity included), a Boolean is bool,
+''' and a String is untyped (like `'text'`), so the server infers dates,
+''' uuids, json and enums from context. `repeat('x', ?)`, `round(?, 2)`,
+''' `? IS NULL OR col = ?` and `? + ?` all work. A NULL has no type, so where
+''' nothing else supplies one (`? IS NULL` with a NULL) write `?::type`. Use
+''' OfTyped or a cast to choose a type yourself. Bytes travel as binary bytea.
+Public Class PgParam
+    Private Property mIsNull As Boolean = False
+    Private Property mText As String = ""
+    Private Property mBinary As Bytes
+    Private Property mIsBinary As Boolean = False
+    Private Property mTypeOid As Integer = 0
+
+    Private Sub Constructor()
+    End Sub
+
+    Public Shared Function OfNull() As PgParam
+        Dim p As New PgParam()
+        p.mIsNull = True
+        Return p
+    End Function
+
+    Public Shared Function OfString(v As String) As PgParam
+        Dim p As New PgParam()
+        p.mText = v
+        Return p
+    End Function
+
+    Public Shared Function OfInteger(v As Integer) As PgParam
+        If v >= -2147483648 And v <= 2147483647 Then
+            Return PgParam.OfTyped(Str(v), PgType.Int4)
+        End If
+        Return PgParam.OfTyped(Str(v), PgType.Int8)
+    End Function
+
+    ''' Sent as numeric with full round-trip precision, so it converts to a
+    ''' float8 column exactly; NaN and ±Infinity included.
+    Public Shared Function OfDouble(v As Double) As PgParam
+        Return PgParam.OfTyped(PgFormatDouble(v), PgType.Numeric)
+    End Function
+
+    Public Shared Function OfBoolean(v As Boolean) As PgParam
+        If v Then
+            Return PgParam.OfTyped("t", PgType.Bool)
+        End If
+        Return PgParam.OfTyped("f", PgType.Bool)
+    End Function
+
+    ''' Binary bytea. The bytes are copied, so later changes to `v` don't leak in.
+    Public Shared Function OfBytes(v As Bytes) As PgParam
+        Dim p As New PgParam()
+        Dim copy As New Bytes()
+        copy.Append(v)
+        p.mBinary = copy
+        p.mIsBinary = True
+        p.mTypeOid = PgType.Bytea
+        Return p
+    End Function
+
+    ''' Text in PostgreSQL's input syntax for the type `typeOid` (see PgType).
+    Public Shared Function OfTyped(valueText As String, typeOid As Integer) As PgParam
+        If typeOid < 0 Or typeOid > 4294967295 Then
+            Throw New InvalidArgumentException("PostgreSQL type OID must be an unsigned 32-bit value")
+        End If
+        Dim p As New PgParam()
+        p.mText = valueText
+        p.mTypeOid = typeOid
+        Return p
+    End Function
+
+    ''' Converts a stdlib DbValue, keeping its kind.
+    Public Shared Function FromDbValue(v As DbValue) As PgParam
+        Select Case v.Kind
+        Case DbValue.KindNull
+            Return PgParam.OfNull()
+        Case DbValue.KindInteger
+            Return PgParam.OfInteger(v.AsInteger())
+        Case DbValue.KindDouble
+            Return PgParam.OfDouble(v.AsDouble())
+        Case DbValue.KindBoolean
+            Return PgParam.OfBoolean(v.AsBoolean())
+        Case Else
+            Return PgParam.OfString(v.AsString())
+        End Select
+    End Function
+
+    Public Shared Function FromDbValues(values As Array Of DbValue) As Array Of PgParam
+        Dim items As Array Of PgParam = []
+        For Each v As DbValue In values
+            Array.Append(items, PgParam.FromDbValue(v))
+        Next
+        Return items
+    End Function
+
+    Internal Function IsNullValue() As Boolean
+        Return Me.mIsNull
+    End Function
+
+    Internal Function IsBinaryValue() As Boolean
+        Return Me.mIsBinary
+    End Function
+
+    Internal Function TextValue() As String
+        Return Me.mText
+    End Function
+
+    Internal Function BinaryValue() As Bytes
+        Return Me.mBinary
+    End Function
+
+    Internal Function TypeOid() As Integer
+        Return Me.mTypeOid
+    End Function
+End Class
+
+''' Marshals an Array Of PgParam into the four parallel C arrays libpq
+''' takes. Every value lives in a Bytes buffer this object owns, so the
+''' pointers stay valid for as long as the binder is referenced — keep it in
+''' a local until the libpq call returns.
+Private Class PgBinder
+    Public Property Count As Integer = 0
+    Private Property mStorage As Array Of Bytes
+    Private Property mValues As Bytes
+    Private Property mLengths As Bytes
+    Private Property mFormats As Bytes
+    Private Property mTypes As Bytes
+
+    Public Sub Constructor(params As Array Of PgParam)
+        Me.mStorage = []
+        Me.mValues = New Bytes()
+        Me.mLengths = New Bytes()
+        Me.mFormats = New Bytes()
+        Me.mTypes = New Bytes()
+        Me.Count = params.Count
+        For Each p As PgParam In params
+            Dim length As Integer = 0
+            Dim format As Integer = 0
+            If p.IsNullValue() Then
+                PgPutInt(Me.mValues, 0, 8)
+            Else
+                Dim data As New Bytes()
+                If p.IsBinaryValue() Then
+                    data.Append(p.BinaryValue())
+                    length = data.Count
+                    format = 1
+                Else
+                    data.Append(Bytes.FromString(p.TextValue(), Text.Encodings.UTF8))
+                End If
+                ' A terminating NUL keeps text values valid C strings and gives
+                ' empty binary values a real (non-Nil) address.
+                data.Append(0)
+                Array.Append(Me.mStorage, data)
+                PgPutInt(Me.mValues, CType(data.DataPtr(), Integer), 8)
+            End If
+            PgPutInt(Me.mLengths, length, 4)
+            PgPutInt(Me.mFormats, format, 4)
+            PgPutInt(Me.mTypes, p.TypeOid(), 4)
+        Next
+    End Sub
+
+    Public Function Values() As Ptr
+        If Me.Count = 0 Then
+            Return Nil
+        End If
+        Return Me.mValues.DataPtr()
+    End Function
+
+    Public Function Lengths() As Ptr
+        If Me.Count = 0 Then
+            Return Nil
+        End If
+        Return Me.mLengths.DataPtr()
+    End Function
+
+    Public Function Formats() As Ptr
+        If Me.Count = 0 Then
+            Return Nil
+        End If
+        Return Me.mFormats.DataPtr()
+    End Function
+
+    Public Function Types() As Ptr
+        If Me.Count = 0 Then
+            Return Nil
+        End If
+        Return Me.mTypes.DataPtr()
+    End Function
+End Class
+
+' ── Row sets ───────────────────────────────────────────────────────────────
+
+''' PostgreSQL RowSet. A plain Query buffers the whole result client-side;
+''' a cursor from PgDatabase.QueryStream holds only one chunk at a time.
+''' Beyond the stdlib RowSet surface it reads values exactly (ValueText),
+''' as bytea (ValueBytes) or JSON (ValueJson), and reports column types and
+''' the affected-row count.
+Public Class PgRowSet Inherits RowSet
+    Protected Property mResult As Ptr
+    Protected Property mRow As Integer = 0
+    Protected Property mRowCount As Integer = 0
+    Protected Property mClosed As Boolean = False
+    Protected Property mColumnNames As Array Of String
+    Protected Property mColumnTypes As Array Of Integer
+    Protected Property mAffected As Integer = 0
+    Protected Property mCommandTag As String = ""
+
+    Internal Sub Constructor(res As Ptr)
+        Me.mColumnNames = []
+        Me.mColumnTypes = []
+        Me.mResult = Nil
+        Me.Adopt(res)
+    End Sub
+
+    ''' Takes ownership of `res` as the current block of rows, freeing any
+    ''' previous block. The column metadata is captured from the first block.
+    Protected Sub Adopt(res As Ptr)
+        If Me.mResult <> Nil Then
+            PQclear(Me.mResult)
+        End If
+        Me.mResult = res
+        Me.mRow = 0
+        Me.mRowCount = 0
+        If res = Nil Then
+            Return
+        End If
+        Me.mRowCount = PQntuples(res)
+        If Me.mColumnNames.Count = 0 Then
+            Dim n As Integer = PQnfields(res)
+            For i As Integer = 0 To n - 1
+                Array.Append(Me.mColumnNames, PQfname(res, i))
+                Dim typeOid As Integer = PQftype(res, i)
+                Array.Append(Me.mColumnTypes, typeOid)
+            Next
+        End If
+        Me.mAffected = Integer.Parse(PQcmdTuples(res)).Or(Me.mAffected)
+        Dim tag As String = PQcmdStatus(res)
+        If tag <> "" Then
+            Me.mCommandTag = tag
+        End If
+    End Sub
+
+    Public Overrides Function HasMoreRows() As Boolean
+        Return Not Me.mClosed And Me.mRow < Me.mRowCount
+    End Function
+
+    Public Overrides Sub NextRow()
+        Me.mRow += 1
+    End Sub
+
+    Public Overrides Function ColumnCount() As Integer
+        Return Me.mColumnNames.Count
+    End Function
+
+    Public Overrides Function ColumnName(index As Integer) As String
+        Return Me.mColumnNames(index)
+    End Function
+
+    ''' The 0-based index of the column named `column`, or -1. An exact match
+    ''' wins; otherwise the first case-insensitive match is used.
+    Public Function ColumnIndex(column As String) As Integer
+        For i As Integer = 0 To Me.mColumnNames.Count - 1
+            If String.Compare(Me.mColumnNames(i), column, True) = 0 Then
+                Return i
+            End If
+        Next
+        For i As Integer = 0 To Me.mColumnNames.Count - 1
+            If String.Compare(Me.mColumnNames(i), column) = 0 Then
+                Return i
+            End If
+        Next
+        Return -1
+    End Function
+
+    ''' The column's PostgreSQL type OID (compare with the PgType constants).
+    Public Function ColumnTypeOid(index As Integer) As Integer
+        Return Me.mColumnTypes(index)
+    End Function
+
+    Private Function RequireColumn(column As String) As Integer
+        Dim index As Integer = Me.ColumnIndex(column)
+        If index < 0 Then
+            Throw New DatabaseException("no such column: " + column)
+        End If
+        Return index
+    End Function
+
+    Private Sub RequireRow()
+        If Me.mClosed Or Me.mRow >= Me.mRowCount Then
+            Throw New DatabaseException("no current row")
+        End If
+    End Sub
+
+    Public Overrides Function Value(column As String) As DbValue
+        Return Me.Value(Me.RequireColumn(column))
+    End Function
+
+    Public Overrides Function Value(index As Integer) As DbValue
+        Me.RequireRow()
+        Return PgReadColumn(Me.mResult, Me.mRow, index)
+    End Function
+
+    Public Function IsNull(index As Integer) As Boolean
+        Me.RequireRow()
+        Return PQgetisnull(Me.mResult, Me.mRow, index) <> 0
+    End Function
+
+    Public Function IsNull(column As String) As Boolean
+        Return Me.IsNull(Me.RequireColumn(column))
+    End Function
+
+    ''' The server's exact text for the value ("" for NULL): full-precision
+    ''' numeric, timestamps, uuids, intervals, arrays, and so on.
+    Public Function ValueText(index As Integer) As String
+        Me.RequireRow()
+        If PQgetisnull(Me.mResult, Me.mRow, index) <> 0 Then
+            Return ""
+        End If
+        Return PQgetvalue(Me.mResult, Me.mRow, index)
+    End Function
+
+    Public Function ValueText(column As String) As String
+        Return Me.ValueText(Me.RequireColumn(column))
+    End Function
+
+    ''' A bytea column decoded to its raw bytes; any other type yields the
+    ''' UTF-8 bytes of its text. NULL yields an empty buffer.
+    Public Function ValueBytes(index As Integer) As Bytes
+        Me.RequireRow()
+        If PQgetisnull(Me.mResult, Me.mRow, index) <> 0 Then
+            Return New Bytes()
+        End If
+        Dim valueText As String = PQgetvalue(Me.mResult, Me.mRow, index)
+        If Me.mColumnTypes(index) = PgType.Bytea Then
+            Return PgDecodeBytea(valueText)
+        End If
+        Return Bytes.FromString(valueText, Text.Encodings.UTF8)
+    End Function
+
+    Public Function ValueBytes(column As String) As Bytes
+        Return Me.ValueBytes(Me.RequireColumn(column))
+    End Function
+
+    ''' A json/jsonb (or any JSON-text) column parsed into a JSONItem; NULL
+    ''' yields an empty null item.
+    Public Function ValueJson(index As Integer) As JSONItem
+        If Me.IsNull(index) Then
+            Return New JSONItem()
+        End If
+        Return Json.Parse(Me.ValueText(index))
+    End Function
+
+    Public Function ValueJson(column As String) As JSONItem
+        Return Me.ValueJson(Me.RequireColumn(column))
+    End Function
+
+    ''' Rows in the buffered result; for a streaming cursor, rows in the
+    ''' current chunk only.
+    Public Function RowCount() As Integer
+        Return Me.mRowCount
+    End Function
+
+    ''' Rows inserted, updated, deleted, copied or selected by the statement.
+    ''' For a streaming cursor this is known only once it is exhausted.
+    Public Function AffectedRows() As Integer
+        Return Me.mAffected
+    End Function
+
+    ''' The command tag, e.g. "INSERT 0 3" or "UPDATE 2".
+    Public Function CommandTag() As String
+        Return Me.mCommandTag
+    End Function
+
+    Public Overrides Sub Close()
+        If Not Me.mClosed Then
+            If Me.mResult <> Nil Then
+                PQclear(Me.mResult)
+                Me.mResult = Nil
+            End If
+            Me.mClosed = True
+        End If
+    End Sub
+
+    ''' Frees the result when a discarded RowSet is released.
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+''' A streaming cursor over one statement, fetched from the server in chunks
+''' (PgDatabase.QueryStream). The connection is dedicated to the cursor until
+''' it is exhausted or closed: other calls on the PgDatabase throw meanwhile.
+''' Close reads and discards any remaining rows; CancelAndClose asks the
+''' server to stop the statement instead (which aborts an open transaction).
+''' A cursor left open across Disconnect/Reconnect simply ends: it never
+''' touches the new connection.
+Public Class PgStreamRowSet Inherits PgRowSet
+    Private Property mDb As PgDatabase
+    Private Property mConn As Ptr
+    Private Property mSessionId As Integer
+    Private Property mDone As Boolean = False
+
+    Internal Sub Constructor(db As PgDatabase, conn As Ptr, sessionId As Integer)
+        Super.Constructor(Nil)
+        Me.mDb = db
+        Me.mConn = conn
+        Me.mSessionId = sessionId
+        Me.FetchChunk()
+    End Sub
+
+    ''' False once the connection this cursor was started on is gone.
+    Private Function OwnsConnection() As Boolean
+        Return Me.mDb.OwnsStream(Me.mSessionId)
+    End Function
+
+    ''' Pulls the next result from libpq: a chunk of rows, or the end of the
+    ''' statement. Throws (after releasing the connection) on a server error.
+    Private Sub FetchChunk()
+        While Not Me.mDone
+            If Not Me.OwnsConnection() Then
+                Me.mDone = True
+                Return
+            End If
+            Dim res As Ptr = PQgetResult(Me.mConn)
+            If res = Nil Then
+                Me.Finish()
+                Return
+            End If
+            Dim status As Integer = PQresultStatus(res)
+            If status = PGRES_TUPLES_CHUNK Then
+                Me.Adopt(res)
+                If Me.mRowCount > 0 Then
+                    Return
+                End If
+            ElseIf status = PGRES_TUPLES_OK Or status = PGRES_COMMAND_OK Or status = PGRES_EMPTY_QUERY Then
+                ' Final (row-less) result: carries the column metadata when the
+                ' statement returned no rows at all, and the command tag.
+                Me.Adopt(res)
+                Me.Drain()
+                Return
+            ElseIf status = PGRES_COPY_IN Or status = PGRES_COPY_OUT Then
+                PQclear(res)
+                PgAbortCopy(Me.mConn, status)
+                Me.Finish()
+                Me.Close()
+                Throw PgCopyMisuse(status)
+            Else
+                Dim e As PgException = PgErrorFromResult(res, PQerrorMessage(Me.mConn))
+                PQclear(res)
+                Me.Drain()
+                Me.Close()
+                Throw e
+            End If
+        Wend
+    End Sub
+
+    Private Sub Drain()
+        If Me.OwnsConnection() Then
+            Dim res As Ptr = PQgetResult(Me.mConn)
+            While res <> Nil
+                PQclear(res)
+                res = PQgetResult(Me.mConn)
+            Wend
+        End If
+        Me.Finish()
+    End Sub
+
+    Private Sub Finish()
+        If Not Me.mDone Then
+            Me.mDone = True
+            If Me.OwnsConnection() Then
+                Me.mDb.EndStream()
+            End If
+        End If
+    End Sub
+
+    Public Overrides Function HasMoreRows() As Boolean
+        If Me.mClosed Then
+            Return False
+        End If
+        If Me.mRow < Me.mRowCount Then
+            Return True
+        End If
+        If Me.mDone Then
+            Return False
+        End If
+        Me.FetchChunk()
+        Return Me.mRow < Me.mRowCount
+    End Function
+
+    ''' Asks the server to cancel the statement, then closes. Cheaper than
+    ''' Close for a huge result you no longer need; inside a transaction the
+    ''' cancellation aborts the transaction.
+    Public Sub CancelAndClose()
+        If Not Me.mDone And Me.OwnsConnection() Then
+            Me.mDb.Cancel()
+        End If
+        Me.Close()
+    End Sub
+
+    Public Overrides Sub Close()
+        If Not Me.mDone Then
+            Me.Drain()
+        End If
+        Super.Close()
+    End Sub
+
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+' ── Prepared statements and notifications ─────────────────────────────────
+
+''' A server-side prepared statement (PgDatabase.Prepare): parsed and planned
+''' once, executed many times. Close deallocates it; a statement is also
+''' closed automatically when released. Every `?` is a placeholder here (the
+''' parameters come later); write `??` for the jsonb `?` operator.
+Public Class PgStatement
+    Private Property mDb As PgDatabase
+    Private Property mName As String
+    Private Property mSessionId As Integer
+    Private Property mScan As PgSqlScanner
+    Private Property mClosed As Boolean = False
+
+    Internal Sub Constructor(db As PgDatabase, name As String, sessionId As Integer, scan As PgSqlScanner)
+        Me.mDb = db
+        Me.mName = name
+        Me.mSessionId = sessionId
+        Me.mScan = scan
+    End Sub
+
+    ''' The server-side statement name.
+    Public Function Name() As String
+        Return Me.mName
+    End Function
+
+    Private Sub RequireOpen()
+        If Me.mClosed Then
+            Throw New DatabaseException("prepared statement is closed")
+        End If
+    End Sub
+
+    Public Function Query(params As Array Of PgParam) As PgRowSet
+        Me.RequireOpen()
+        Return Me.mDb.RunPrepared(Me.mName, Me.mSessionId, Me.mScan, params)
+    End Function
+
+    Public Function Query(params As Array Of DbValue) As PgRowSet
+        Return Me.Query(PgParam.FromDbValues(params))
+    End Function
+
+    Public Function Query() As PgRowSet
+        Dim noParams As Array Of PgParam = []
+        Return Me.Query(noParams)
+    End Function
+
+    ''' Runs the statement and returns the affected-row count.
+    Public Function Execute(params As Array Of PgParam) As Integer
+        Dim rs As PgRowSet = Me.Query(params)
+        Dim affected As Integer = rs.AffectedRows()
+        rs.Close()
+        Return affected
+    End Function
+
+    Public Function Execute(params As Array Of DbValue) As Integer
+        Return Me.Execute(PgParam.FromDbValues(params))
+    End Function
+
+    ''' Streams the statement's rows in chunks (see PgDatabase.QueryStream).
+    Public Function QueryStream(params As Array Of PgParam, chunkSize As Integer = 1000) As PgStreamRowSet
+        Me.RequireOpen()
+        Return Me.mDb.StreamPrepared(Me.mName, Me.mSessionId, Me.mScan, params, chunkSize)
+    End Function
+
+    ''' Deallocates the statement. While a streaming cursor holds the
+    ''' connection, the deallocation is queued and runs on the next call.
+    Public Sub Close()
+        If Not Me.mClosed Then
+            Me.mClosed = True
+            Me.mDb.ClosePrepared(Me.mName, Me.mSessionId)
+        End If
+    End Sub
+
+    Public Sub Destructor()
+        Try
+            Me.Close()
+        Catch e As DatabaseException
+            ' Best effort: the connection may be gone.
+        End Try
+    End Sub
+End Class
+
+''' One NOTIFY delivered to a session that LISTENs on its channel.
+Public Class PgNotification
+    Public Property Channel As String = ""
+    Public Property Payload As String = ""
+    ''' The backend process id of the notifying session.
+    Public Property ProcessId As Integer = 0
+End Class
+
+' ── Database ───────────────────────────────────────────────────────────────
+
+''' PostgreSQL implementation of the stdlib Database. Construct, then
+''' Connect with a libpq connection string or URI, e.g.
+''' "host=localhost dbname=app user=app sslmode=require" or
+''' "postgresql://app@localhost/app?sslmode=verify-full".
+'''
+''' A PgDatabase is one connection: use it from one thread at a time. The
+''' exception is Cancel, which may be called from any thread.
+Public Class PgDatabase Inherits Database
+    Private Property mConn As Ptr
+    Private Property mCancelGuard As Mutex = New Mutex()
+    Private Property mCancel As Ptr
+    Private Property mConnected As Boolean = False
+    Private Property mStreaming As Boolean = False
+    Private Property mSessionId As Integer = 0
+    Private Property mStatementCounter As Integer = 0
+    ''' When mInsertKnown, mLastInsertTable is the target of the latest plain
+    ''' INSERT; otherwise LastInsertId falls back to lastval().
+    Private Property mInsertKnown As Boolean = False
+    Private Property mLastInsertTable As String = ""
+    Private Property mSequenceTables As Array Of String
+    Private Property mSequenceNames As Array Of String
+    Private Property mPendingCloses As Array Of String
+
+    Public Sub Constructor()
+        Me.mConn = Nil
+        Me.mCancel = Nil
+        Me.mSequenceTables = []
+        Me.mSequenceNames = []
+        Me.mPendingCloses = []
+    End Sub
+
+    ''' Starts a new session generation: statements and cursors from the old
+    ''' one are rejected or end quietly instead of touching the new one.
+    Private Sub ResetSession()
+        Me.mStreaming = False
+        Me.mSessionId += 1
+        Me.mInsertKnown = False
+        Me.mLastInsertTable = ""
+        Me.mSequenceTables = []
+        Me.mSequenceNames = []
+        Me.mPendingCloses = []
+    End Sub
+
+    ' ── Connection ───────────────────────────────────────────────────────
+
+    Public Overrides Sub Connect(connectionString As String)
+        If Me.mConnected Then
+            Me.Disconnect()
+        End If
+        SyncLock Me.mCancelGuard
+        Dim conn As Ptr = PQconnectdb(connectionString)
+        If conn = Nil Then
+            Throw New PgException("out of memory allocating a PostgreSQL connection")
+        End If
+        If PQstatus(conn) <> CONNECTION_OK Then
+            Dim e As New PgException(String.Trim(PQerrorMessage(conn)))
+            PQfinish(conn)
+            Throw e
+        End If
+        Me.mConn = conn
+        Me.mConnected = True
+        Me.ResetSession()
+        Me.mCancel = PQcancelCreate(conn)
+        ' Text values cross the FFI as UTF-8 regardless of the server's
+        ' default client encoding.
+        Me.Execute("SET client_encoding TO 'UTF8'")
+        End SyncLock
+    End Sub
+
+    Public Overrides Sub Disconnect()
+        SyncLock Me.mCancelGuard
+        If Me.mConnected Then
+            If Me.mCancel <> Nil Then
+                PQcancelFinish(Me.mCancel)
+                Me.mCancel = Nil
+            End If
+            PQfinish(Me.mConn)
+            Me.mConn = Nil
+            Me.mConnected = False
+            Me.ResetSession()
+        End If
+        End SyncLock
+    End Sub
+
+    ''' True while the connection is open and healthy (False once the server
+    ''' has gone away, even before Disconnect).
+    Public Overrides Function IsConnected() As Boolean
+        Return Me.mConnected And PQstatus(Me.mConn) = CONNECTION_OK
+    End Function
+
+    ''' Re-establishes a broken connection with the original parameters.
+    ''' Session state (prepared statements, LISTENs, SET values) is lost, and
+    ''' an open streaming cursor ends.
+    Public Sub Reconnect()
+        SyncLock Me.mCancelGuard
+        If Not Me.mConnected Then
+            Throw New DatabaseException("not connected")
+        End If
+        Me.ResetSession()
+        PQreset(Me.mConn)
+        If PQstatus(Me.mConn) <> CONNECTION_OK Then
+            Throw New PgException(String.Trim(PQerrorMessage(Me.mConn)))
+        End If
+        If Me.mCancel <> Nil Then
+            PQcancelFinish(Me.mCancel)
+        End If
+        Me.mCancel = PQcancelCreate(Me.mConn)
+        Me.Execute("SET client_encoding TO 'UTF8'")
+        End SyncLock
+    End Sub
+
+    ''' Asks the server to cancel the statement currently running on this
+    ''' connection. Safe to call from another thread. Returns True when the
+    ''' request was delivered; the running call then fails with SQLSTATE 57014.
+    Public Function Cancel() As Boolean
+        SyncLock Me.mCancelGuard
+        If Not Me.mConnected Or Me.mCancel = Nil Then
+            Return False
+        End If
+        Dim delivered As Boolean = PQcancelBlocking(Me.mCancel) = 1
+        PQcancelReset(Me.mCancel)
+        Return delivered
+        End SyncLock
+    End Function
+
+    Public Sub Destructor()
+        Me.Disconnect()
+    End Sub
+
+    ' ── Session information ──────────────────────────────────────────────
+
+    ''' The server version as an integer, e.g. 180006 for 18.6.
+    Public Function ServerVersion() As Integer
+        Me.RequireConnection()
+        Return PQserverVersion(Me.mConn)
+    End Function
+
+    ''' The process id of the backend serving this connection.
+    Public Function BackendPid() As Integer
+        Me.RequireConnection()
+        Return PQbackendPID(Me.mConn)
+    End Function
+
+    ''' A server-reported setting such as "server_version", "TimeZone" or
+    ''' "standard_conforming_strings"; "" if unknown.
+    Public Function ParameterStatus(name As String) As String
+        Me.RequireConnection()
+        Return PgCopyCString(PQparameterStatus(Me.mConn, name))
+    End Function
+
+    ''' True inside a transaction block, including a failed one awaiting ROLLBACK.
+    Public Function InTransaction() As Boolean
+        Me.RequireConnection()
+        Dim status As Integer = PQtransactionStatus(Me.mConn)
+        Return status = PQTRANS_INTRANS Or status = PQTRANS_INERROR
+    End Function
+
+    ''' True inside a transaction that has failed and must be rolled back.
+    Public Function InFailedTransaction() As Boolean
+        Me.RequireConnection()
+        Return PQtransactionStatus(Me.mConn) = PQTRANS_INERROR
+    End Function
+
+    ''' Quotes `name` as an SQL identifier ("my table" → "\"my table\"").
+    Public Function QuoteIdentifier(name As String) As String
+        Me.RequireConnection()
+        Dim p As Ptr = PQescapeIdentifier(Me.mConn, name, PgUtf8Length(name))
+        If p = Nil Then
+            Throw New PgException(String.Trim(PQerrorMessage(Me.mConn)))
+        End If
+        Dim quoted As String = PgCopyCString(p)
+        PQfreemem(p)
+        Return quoted
+    End Function
+
+    ''' Quotes `value` as an SQL string literal. Prefer bound parameters; this
+    ''' is for the few places they're not allowed (some DDL and utility
+    ''' statements).
+    Public Function QuoteLiteral(value As String) As String
+        Me.RequireConnection()
+        Dim p As Ptr = PQescapeLiteral(Me.mConn, value, PgUtf8Length(value))
+        If p = Nil Then
+            Throw New PgException(String.Trim(PQerrorMessage(Me.mConn)))
+        End If
+        Dim quoted As String = PgCopyCString(p)
+        PQfreemem(p)
+        Return quoted
+    End Function
+
+    ' ── Queries ──────────────────────────────────────────────────────────
+
+    Private Sub RequireConnection()
+        If Not Me.mConnected Then
+            Throw New DatabaseException("not connected")
+        End If
+    End Sub
+
+    Private Sub RequireIdle()
+        Me.RequireConnection()
+        If Me.mStreaming Then
+            Throw New DatabaseException("connection is busy with a streaming cursor; close it first")
+        End If
+        If Me.mPendingCloses.Count > 0 Then
+            ' Statements closed while a cursor held the connection.
+            Dim names As Array Of String = Me.mPendingCloses
+            Me.mPendingCloses = []
+            For Each name As String In names
+                Dim res As Ptr = PQclosePrepared(Me.mConn, name)
+                If res <> Nil Then
+                    PQclear(res)
+                End If
+            Next
+        End If
+    End Sub
+
+    Internal Function OwnsStream(sessionId As Integer) As Boolean
+        Return Me.mConnected And Me.mStreaming And sessionId = Me.mSessionId
+    End Function
+
+    Internal Sub EndStream()
+        Me.mStreaming = False
+    End Sub
+
+    ''' Throws (freeing `res`) unless `res` is a success result. A COPY that
+    ''' arrived through a plain query is ended first, so the connection is
+    ''' left usable.
+    Private Function CheckResult(res As Ptr) As Ptr
+        If res = Nil Then
+            Throw PgErrorFromResult(Nil, PQerrorMessage(Me.mConn))
+        End If
+        Dim status As Integer = PQresultStatus(res)
+        If status = PGRES_COPY_IN Or status = PGRES_COPY_OUT Then
+            PQclear(res)
+            PgAbortCopy(Me.mConn, status)
+            Throw PgCopyMisuse(status)
+        End If
+        If status <> PGRES_COMMAND_OK And status <> PGRES_TUPLES_OK And status <> PGRES_EMPTY_QUERY Then
+            Dim e As PgException = PgErrorFromResult(res, PQerrorMessage(Me.mConn))
+            PQclear(res)
+            Throw e
+        End If
+        Return res
+    End Function
+
+    ''' Scans a query's SQL and tracks it for LastInsertId. A COPY that streams
+    ''' data is refused before anything is sent — through a plain query it
+    ''' would leave the connection in COPY mode, and in a multi-statement
+    ''' string the statements after it would still run.
+    Private Function ScanQuery(sql As String, numberPlaceholders As Boolean) As PgSqlScanner
+        Dim scan As PgSqlScanner = PgScanSql(sql, numberPlaceholders)
+        If scan.CopyStatements > 0 Then
+            Throw New DatabaseException("use PgDatabase.CopyFrom / CopyTo for COPY ... FROM STDIN / TO STDOUT")
+        End If
+        Me.TrackStatement(scan)
+        Return scan
+    End Function
+
+    ''' Remembers the target table of a plain INSERT for LastInsertId.
+    ''' Statements whose inserts aren't followed (WITH, COPY, MERGE, DO, CALL,
+    ''' EXECUTE, several statements at once) switch LastInsertId to
+    ''' lastval(). DDL, ROLLBACK and SET/RESET/DISCARD (which can change what
+    ''' a table name resolves to) forget the cached sequence names. Anything
+    ''' else — SELECT, UPDATE, DELETE — leaves the tracking alone, so an
+    ''' insert made inside a function called from a SELECT isn't followed.
+    Private Sub TrackStatement(scan As PgSqlScanner)
+        Dim first As String = scan.FirstStatement
+        If scan.Statements > 1 Then
+            Me.mInsertKnown = False
+            Me.ForgetSequences()
+        ElseIf PgStartsWithWord(first, "INSERT") Then
+            Me.mLastInsertTable = PgInsertTarget(first)
+            Me.mInsertKnown = Me.mLastInsertTable <> ""
+        ElseIf PgStartsWithWord(first, "WITH") Or PgStartsWithWord(first, "COPY") Or _
+            PgStartsWithWord(first, "MERGE") Or PgStartsWithWord(first, "DO") Or _
+            PgStartsWithWord(first, "CALL") Or PgStartsWithWord(first, "EXECUTE") Then
+            Me.mInsertKnown = False
+        ElseIf PgStartsWithWord(first, "CREATE") Or PgStartsWithWord(first, "ALTER") Or _
+            PgStartsWithWord(first, "DROP") Or PgStartsWithWord(first, "ROLLBACK") Or _
+            PgStartsWithWord(first, "SET") Or PgStartsWithWord(first, "RESET") Or _
+            PgStartsWithWord(first, "DISCARD") Then
+            Me.ForgetSequences()
+        End If
+    End Sub
+
+    Private Sub ForgetSequences()
+        Me.mSequenceTables = []
+        Me.mSequenceNames = []
+    End Sub
+
+    ''' Runs `sql` with no parameters. Several `;`-separated statements are
+    ''' allowed; the result of the last one is returned.
+    '''
+    ''' Placeholder rule for every query method: with parameters, each `?` is
+    ''' a placeholder; with none, a lone `?` is left alone (it can only be the
+    ''' jsonb operator); `??` always means a literal `?`.
+    Public Overrides Function Query(sql As String) As RowSet
+        Return Me.QueryPg(sql)
+    End Function
+
+    Public Overrides Function Query(sql As String, params As Array Of DbValue) As RowSet
+        Return Me.QueryPg(sql, PgParam.FromDbValues(params))
+    End Function
+
+    Public Function Query(sql As String, params As Array Of PgParam) As RowSet
+        Return Me.QueryPg(sql, params)
+    End Function
+
+    ''' Query returning the PostgreSQL row set type directly, so its extra
+    ''' accessors (ValueText, ValueBytes, AffectedRows …) need no cast.
+    Public Function QueryPg(sql As String) As PgRowSet
+        Me.RequireIdle()
+        Dim scan As PgSqlScanner = Me.ScanQuery(sql, False)
+        Return New PgRowSet(Me.CheckResult(PQexec(Me.mConn, scan.Sql)))
+    End Function
+
+    Public Function QueryPg(sql As String, params As Array Of PgParam) As PgRowSet
+        Me.RequireIdle()
+        Dim scan As PgSqlScanner = Me.ScanQuery(sql, params.Count > 0)
+        Dim binder As New PgBinder(params)
+        Dim res As Ptr = PQexecParams(Me.mConn, scan.Sql, binder.Count, _
+            binder.Types(), binder.Values(), binder.Lengths(), binder.Formats(), 0)
+        Return New PgRowSet(Me.CheckResult(res))
+    End Function
+
+    Public Function QueryPg(sql As String, params As Array Of DbValue) As PgRowSet
+        Return Me.QueryPg(sql, PgParam.FromDbValues(params))
+    End Function
+
+    ''' Runs a statement and returns its affected-row count.
+    Public Function Execute(sql As String) As Integer
+        Dim rs As PgRowSet = Me.QueryPg(sql)
+        Dim affected As Integer = rs.AffectedRows()
+        rs.Close()
+        Return affected
+    End Function
+
+    Public Function Execute(sql As String, params As Array Of PgParam) As Integer
+        Dim rs As PgRowSet = Me.QueryPg(sql, params)
+        Dim affected As Integer = rs.AffectedRows()
+        rs.Close()
+        Return affected
+    End Function
+
+    Public Function Execute(sql As String, params As Array Of DbValue) As Integer
+        Return Me.Execute(sql, PgParam.FromDbValues(params))
+    End Function
+
+    ''' The first column of the first row (NULL when there are no rows).
+    Public Function QueryScalar(sql As String, params As Array Of PgParam) As DbValue
+        Dim rs As PgRowSet = Me.QueryPg(sql, params)
+        Dim v As DbValue = DbValue.OfNull()
+        If rs.HasMoreRows() And rs.ColumnCount() > 0 Then
+            v = rs.Value(0)
+        End If
+        rs.Close()
+        Return v
+    End Function
+
+    Public Function QueryScalar(sql As String, params As Array Of DbValue) As DbValue
+        Return Me.QueryScalar(sql, PgParam.FromDbValues(params))
+    End Function
+
+    Public Function QueryScalar(sql As String) As DbValue
+        Dim noParams As Array Of PgParam = []
+        Return Me.QueryScalar(sql, noParams)
+    End Function
+
+    ''' Streams one statement's rows from the server in chunks of `chunkSize`,
+    ''' so memory stays flat however large the result is. The connection is
+    ''' reserved for the cursor until it is exhausted or closed.
+    Public Function QueryStream(sql As String, params As Array Of PgParam, chunkSize As Integer = 1000) As PgStreamRowSet
+        Me.RequireIdle()
+        Dim scan As PgSqlScanner = Me.ScanQuery(sql, params.Count > 0)
+        Dim binder As New PgBinder(params)
+        Dim sent As Integer = PQsendQueryParams(Me.mConn, scan.Sql, binder.Count, _
+            binder.Types(), binder.Values(), binder.Lengths(), binder.Formats(), 0)
+        Return Me.BeginStream(sent, chunkSize)
+    End Function
+
+    Public Function QueryStream(sql As String, params As Array Of DbValue, chunkSize As Integer = 1000) As PgStreamRowSet
+        Return Me.QueryStream(sql, PgParam.FromDbValues(params), chunkSize)
+    End Function
+
+    Public Function QueryStream(sql As String) As PgStreamRowSet
+        Dim noParams As Array Of PgParam = []
+        Return Me.QueryStream(sql, noParams)
+    End Function
+
+    Private Function BeginStream(sent As Integer, chunkSize As Integer) As PgStreamRowSet
+        If sent <> 1 Then
+            Throw New PgException(String.Trim(PQerrorMessage(Me.mConn)))
+        End If
+        Dim size As Integer = chunkSize
+        If size < 1 Then
+            size = 1
+        End If
+        If PQsetChunkedRowsMode(Me.mConn, size) <> 1 Then
+            Dim res As Ptr = PQgetResult(Me.mConn)
+            While res <> Nil
+                PQclear(res)
+                res = PQgetResult(Me.mConn)
+            Wend
+            Throw New DatabaseException("could not enable chunked rows mode")
+        End If
+        Me.mStreaming = True
+        Return New PgStreamRowSet(Me, Me.mConn, Me.mSessionId)
+    End Function
+
+    ' ── Prepared statements ──────────────────────────────────────────────
+
+    ''' Parses and plans `sql` once on the server. Parameter types are inferred
+    ''' from the statement; add `?::type` casts where the context is ambiguous.
+    Public Function Prepare(sql As String) As PgStatement
+        Me.RequireIdle()
+        Me.mStatementCounter += 1
+        Dim name As String = "buoy_pg_" + Str(Me.mStatementCounter)
+        Dim scan As PgSqlScanner = PgScanSql(sql, True)
+        Dim res As Ptr = PQprepare(Me.mConn, name, scan.Sql, 0, Nil)
+        PQclear(Me.CheckResult(res))
+        Return New PgStatement(Me, name, Me.mSessionId, scan)
+    End Function
+
+    Private Sub RequireSession(sessionId As Integer)
+        Me.RequireIdle()
+        If sessionId <> Me.mSessionId Then
+            Throw New DatabaseException("prepared statement belongs to an earlier connection")
+        End If
+    End Sub
+
+    Internal Function RunPrepared(name As String, sessionId As Integer, scan As PgSqlScanner, params As Array Of PgParam) As PgRowSet
+        Me.RequireSession(sessionId)
+        Me.TrackStatement(scan)
+        Dim binder As New PgBinder(params)
+        Dim res As Ptr = PQexecPrepared(Me.mConn, name, binder.Count, binder.Values(), _
+            binder.Lengths(), binder.Formats(), 0)
+        Return New PgRowSet(Me.CheckResult(res))
+    End Function
+
+    Internal Function StreamPrepared(name As String, sessionId As Integer, scan As PgSqlScanner, params As Array Of PgParam, chunkSize As Integer) As PgStreamRowSet
+        Me.RequireSession(sessionId)
+        Me.TrackStatement(scan)
+        Dim binder As New PgBinder(params)
+        Dim sent As Integer = PQsendQueryPrepared(Me.mConn, name, binder.Count, binder.Values(), _
+            binder.Lengths(), binder.Formats(), 0)
+        Return Me.BeginStream(sent, chunkSize)
+    End Function
+
+    Internal Sub ClosePrepared(name As String, sessionId As Integer)
+        If Not Me.mConnected Or sessionId <> Me.mSessionId Then
+            Return
+        End If
+        If Me.mStreaming Then
+            Array.Append(Me.mPendingCloses, name)
+            Return
+        End If
+        PQclear(Me.CheckResult(PQclosePrepared(Me.mConn, name)))
+    End Sub
+
+    ' ── Inserted ids ─────────────────────────────────────────────────────
+
+    ''' The id generated by the most recent INSERT through this connection.
+    ''' For a single `INSERT INTO <table>` (plain or prepared, comments
+    ''' allowed) it reads that table's own serial/identity sequence with
+    ''' currval(), so a trigger that touches another sequence can't skew it,
+    ''' and it returns 0 for a table without one. After WITH, COPY, MERGE or a
+    ''' multi-statement string it falls back to lastval(). Returns 0 when
+    ''' there is no id. Prefer `INSERT … RETURNING id` in new code.
+    Public Overrides Function LastInsertId() As Integer
+        Me.RequireIdle()
+        If Me.mInsertKnown Then
+            Dim sequence As String = Me.SequenceFor(Me.mLastInsertTable)
+            If sequence = "" Then
+                Return 0
+            End If
+            Return Integer.Parse(Me.SafeScalar("SELECT currval($1::regclass)", [PgParam.OfString(sequence)])).Or(0)
+        End If
+        Dim noParams As Array Of PgParam = []
+        Return Integer.Parse(Me.SafeScalar("SELECT lastval()", noParams)).Or(0)
+    End Function
+
+    Private Function SequenceFor(table As String) As String
+        For i As Integer = 0 To Me.mSequenceTables.Count - 1
+            ' Case-sensitive: "Orders" and "orders" are different tables.
+            If String.Compare(Me.mSequenceTables(i), table, True) = 0 Then
+                Return Me.mSequenceNames(i)
+            End If
+        Next
+        Dim sequence As String = Me.SafeScalar("SELECT s FROM (SELECT pg_get_serial_sequence($1, attname) AS s, attnum " + _
+            "FROM pg_attribute WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped) q " + _
+            "WHERE s IS NOT NULL ORDER BY attnum LIMIT 1", [PgParam.OfString(table)])
+        Array.Append(Me.mSequenceTables, table)
+        Array.Append(Me.mSequenceNames, sequence)
+        Return sequence
+    End Function
+
+    ''' Runs a single-value query that is allowed to fail, returning "" on
+    ''' error or NULL. Inside a transaction it runs under a savepoint so a
+    ''' failure doesn't abort the caller's transaction.
+    Private Function SafeScalar(sql As String, params As Array Of PgParam) As String
+        Dim status As Integer = PQtransactionStatus(Me.mConn)
+        If status = PQTRANS_INERROR Then
+            Return ""
+        End If
+        Dim guarded As Boolean = status = PQTRANS_INTRANS
+        If guarded Then
+            PQclear(Me.CheckResult(PQexec(Me.mConn, "SAVEPOINT buoy_pg_scalar")))
+        End If
+        Dim binder As New PgBinder(params)
+        Dim res As Ptr = PQexecParams(Me.mConn, sql, binder.Count, binder.Types(), binder.Values(), _
+            binder.Lengths(), binder.Formats(), 0)
+        Dim valueText As String = ""
+        Dim succeeded As Boolean = False
+        If res <> Nil Then
+            If PQresultStatus(res) = PGRES_TUPLES_OK Then
+                succeeded = True
+                If PQntuples(res) > 0 And PQnfields(res) > 0 Then
+                    If PQgetisnull(res, 0, 0) = 0 Then
+                        valueText = PQgetvalue(res, 0, 0)
+                    End If
+                End If
+            End If
+            PQclear(res)
+        End If
+        If guarded Then
+            If succeeded Then
+                PQclear(Me.CheckResult(PQexec(Me.mConn, "RELEASE SAVEPOINT buoy_pg_scalar")))
+            Else
+                PQclear(Me.CheckResult(PQexec(Me.mConn, "ROLLBACK TO SAVEPOINT buoy_pg_scalar")))
+                PQclear(Me.CheckResult(PQexec(Me.mConn, "RELEASE SAVEPOINT buoy_pg_scalar")))
+            End If
+        End If
+        Return valueText
+    End Function
+
+    ' ── LISTEN / NOTIFY ──────────────────────────────────────────────────
+
+    ''' Subscribes this session to `channel`. Notifications arrive between
+    ''' transactions; read them with WaitForNotification or PendingNotifications.
+    Public Sub Listen(channel As String)
+        Me.Execute("LISTEN " + Me.QuoteIdentifier(channel))
+    End Sub
+
+    Public Sub Unlisten(channel As String)
+        Me.Execute("UNLISTEN " + Me.QuoteIdentifier(channel))
+    End Sub
+
+    Public Sub UnlistenAll()
+        Me.Execute("UNLISTEN *")
+    End Sub
+
+    ''' Sends a notification. Inside a transaction it is delivered on COMMIT.
+    Public Sub Notify(channel As String, payload As String = "")
+        Me.Execute("SELECT pg_notify($1, $2)", [PgParam.OfString(channel), PgParam.OfString(payload)])
+    End Sub
+
+    ''' Every notification already received, without blocking.
+    Public Function PendingNotifications() As Array Of PgNotification
+        Me.RequireIdle()
+        Me.ConsumeInput()
+        Dim items As Array Of PgNotification = []
+        Dim n As PgNotification = Me.NextQueuedNotification()
+        While n IsNot Nil
+            Array.Append(items, n)
+            n = Me.NextQueuedNotification()
+        Wend
+        Return items
+    End Function
+
+    ''' Waits up to `timeoutMs` milliseconds (negative: forever) for the next
+    ''' notification; returns Nil on timeout.
+    Public Function WaitForNotification(timeoutMs As Integer) As PgNotification
+        Me.RequireIdle()
+        Dim deadline As Integer = System.Microseconds() + timeoutMs * 1000
+        Me.ConsumeInput()
+        Dim n As PgNotification = Me.NextQueuedNotification()
+        While n Is Nil
+            Dim wait As Integer = -1
+            If timeoutMs >= 0 Then
+                Dim remaining As Integer = deadline - System.Microseconds()
+                If remaining <= 0 Then
+                    Return Nil
+                End If
+                wait = (remaining + 999) \ 1000
+            End If
+            Dim socket As Integer = PQsocket(Me.mConn)
+            If socket < 0 Then
+                Throw New PgException("connection has no socket")
+            End If
+            PgWaitReadable(socket, wait)
+            Me.ConsumeInput()
+            n = Me.NextQueuedNotification()
+        Wend
+        Return n
+    End Function
+
+    Private Sub ConsumeInput()
+        If PQconsumeInput(Me.mConn) = 0 Then
+            Throw New PgException(String.Trim(PQerrorMessage(Me.mConn)))
+        End If
+    End Sub
+
+    ''' Reads and frees one queued PGnotify:
+    ''' { char *relname; int be_pid; char *extra; … } at offsets 0, 8, 16.
+    Private Function NextQueuedNotification() As PgNotification
+        Dim p As Ptr = PQnotifies(Me.mConn)
+        If p = Nil Then
+            Return Nil
+        End If
+        Dim raw As New Bytes()
+        raw.Append(p, 24)
+        Dim n As New PgNotification()
+        n.Channel = PgCopyCString(CType(PgGetInt(raw, 0, 8), Ptr))
+        n.ProcessId = PgGetInt(raw, 8, 4)
+        n.Payload = PgCopyCString(CType(PgGetInt(raw, 16, 8), Ptr))
+        PQfreemem(p)
+        Return n
+    End Function
+
+    ' ── COPY ─────────────────────────────────────────────────────────────
+
+    ''' Runs a `COPY … FROM STDIN` statement, sending `data` (already in the
+    ''' statement's format: text, csv, …). Returns the number of rows copied.
+    Public Function CopyFrom(sql As String, data As String) As Integer
+        Dim scan As PgSqlScanner = Me.BeginCopy(sql)
+        Dim res As Ptr = PQexec(Me.mConn, scan.Sql)
+        If res = Nil Or PQresultStatus(res) <> PGRES_COPY_IN Then
+            Me.CheckResult(res)
+            PQclear(res)
+            Throw New DatabaseException("CopyFrom needs a COPY ... FROM STDIN statement")
+        End If
+        PQclear(res)
+        Dim payload As Bytes = Bytes.FromString(data, Text.Encodings.UTF8)
+        Dim offset As Integer = 0
+        Dim failed As Boolean = False
+        While offset < payload.Count And Not failed
+            Dim size As Integer = payload.Count - offset
+            If size > PG_COPY_CHUNK Then
+                size = PG_COPY_CHUNK
+            End If
+            If PQputCopyData(Me.mConn, PgOffsetPtr(payload.DataPtr(), offset), size) <> 1 Then
+                failed = True
+            End If
+            offset += size
+        Wend
+        If failed Then
+            PQputCopyEndWithError(Me.mConn, "client failed to send COPY data")
+        Else
+            PQputCopyEnd(Me.mConn, Nil)
+        End If
+        Return Me.FinishCopy()
+    End Function
+
+    ''' COPY FROM STDIN in text format, one row per entry (see CopyRow).
+    Public Function CopyFrom(sql As String, rows As Array Of Array Of DbValue) As Integer
+        Dim lines As Array Of String = []
+        For Each row As Array Of DbValue In rows
+            lines.Append(PgDatabase.CopyRow(row))
+        Next
+        Return Me.CopyFrom(sql, String.Join(lines, ""))
+    End Function
+
+    ''' Runs a `COPY … TO STDOUT` statement and returns everything it wrote.
+    Public Function CopyTo(sql As String) As String
+        Dim scan As PgSqlScanner = Me.BeginCopy(sql)
+        Dim res As Ptr = PQexec(Me.mConn, scan.Sql)
+        If res = Nil Or PQresultStatus(res) <> PGRES_COPY_OUT Then
+            Me.CheckResult(res)
+            PQclear(res)
+            Throw New DatabaseException("CopyTo needs a COPY ... TO STDOUT statement")
+        End If
+        PQclear(res)
+        Dim collected As New Bytes()
+        Dim buffer As Ptr = Nil
+        Dim n As Integer = PQgetCopyData(Me.mConn, buffer, 0)
+        While n > 0
+            collected.Append(buffer, n)
+            PQfreemem(buffer)
+            buffer = Nil
+            n = PQgetCopyData(Me.mConn, buffer, 0)
+        Wend
+        Me.FinishCopy()
+        Return collected.ToString(Text.Encodings.UTF8)
+    End Function
+
+    ''' Checks a COPY statement before it is sent: exactly one statement, with
+    ''' `??` collapsed like every other query.
+    Private Function BeginCopy(sql As String) As PgSqlScanner
+        Me.RequireIdle()
+        Dim scan As PgSqlScanner = PgScanSql(sql, False)
+        If scan.Statements <> 1 Or scan.CopyStatements <> 1 Then
+            Throw New DatabaseException("CopyFrom/CopyTo take exactly one COPY statement")
+        End If
+        Me.TrackStatement(scan)
+        Return scan
+    End Function
+
+    Private Function FinishCopy() As Integer
+        Dim res As Ptr = PQgetResult(Me.mConn)
+        Dim affected As Integer = 0
+        Dim failure As PgException = Nil
+        While res <> Nil
+            Dim status As Integer = PQresultStatus(res)
+            If status = PGRES_COMMAND_OK Then
+                affected = Integer.Parse(PQcmdTuples(res)).Or(0)
+            ElseIf status = PGRES_COPY_IN Or status = PGRES_COPY_OUT Then
+                ' Defensive: BeginCopy admits one statement, so a second COPY
+                ' can't follow; end it rather than spin if one ever does.
+                PQclear(res)
+                PgAbortCopy(Me.mConn, status)
+                Throw New DatabaseException("CopyFrom/CopyTo take exactly one COPY statement")
+            ElseIf failure Is Nil Then
+                failure = PgErrorFromResult(res, PQerrorMessage(Me.mConn))
+            End If
+            PQclear(res)
+            res = PQgetResult(Me.mConn)
+        Wend
+        If failure IsNot Nil Then
+            Throw failure
+        End If
+        Return affected
+    End Function
+
+    ''' Encodes one row for COPY's text format: tab-separated, `\N` for NULL,
+    ''' backslash escapes for tab/newline/CR/backslash, newline-terminated.
+    Public Shared Function CopyRow(fields As Array Of DbValue) As String
+        Dim parts As Array Of String = []
+        For Each v As DbValue In fields
+            Select Case v.Kind
+            Case DbValue.KindNull
+                parts.Append("\\N")
+            Case DbValue.KindInteger
+                parts.Append(Str(v.AsInteger()))
+            Case DbValue.KindDouble
+                parts.Append(PgFormatDouble(v.AsDouble()))
+            Case DbValue.KindBoolean
+                If v.AsBoolean() Then
+                    parts.Append("t")
+                Else
+                    parts.Append("f")
+                End If
+            Case Else
+                Dim s As String = String.Replace(v.AsString(), "\\", "\\\\", True)
+                s = String.Replace(s, "\t", "\\t", True)
+                s = String.Replace(s, "\n", "\\n", True)
+                s = String.Replace(s, "\r", "\\r", True)
+                parts.Append(s)
+            End Select
+        Next
+        Return String.Join(parts, "\t") + "\n"
+    End Function
+
+    ' ── Large objects ────────────────────────────────────────────────────
+
+    ''' Runs `work` inside a transaction (large-object calls require one),
+    ''' opening and closing one only when none is already active.
+    Private Function BeginImplicitTransaction() As Boolean
+        Me.RequireIdle()
+        If PQtransactionStatus(Me.mConn) = PQTRANS_IDLE Then
+            Me.Execute("BEGIN")
+            Return True
+        End If
+        Return False
+    End Function
+
+    Private Sub EndImplicitTransaction(implicit As Boolean, succeeded As Boolean)
+        If implicit Then
+            If succeeded Then
+                Me.Execute("COMMIT")
+            Else
+                Me.Execute("ROLLBACK")
+            End If
+        End If
+    End Sub
+
+    Private Function LoFailure(what As String) As PgException
+        Return New PgException(what + ": " + String.Trim(PQerrorMessage(Me.mConn)))
+    End Function
+
+    ''' Stores `data` as a new large object and returns its OID.
+    Public Function CreateLargeObject(data As Bytes) As Integer
+        Dim implicit As Boolean = Me.BeginImplicitTransaction()
+        Try
+            Dim oid As Integer = lo_creat(Me.mConn, INV_READ Or INV_WRITE)
+            If oid = 0 Then
+                Throw Me.LoFailure("lo_creat failed")
+            End If
+            Me.WriteLargeObjectData(oid, data, False)
+            Me.EndImplicitTransaction(implicit, True)
+            Return oid
+        Catch e As DatabaseException
+            Me.EndImplicitTransaction(implicit, False)
+            Throw e
+        End Try
+    End Function
+
+    ''' Replaces the contents of large object `oid` with `data`.
+    Public Sub WriteLargeObject(oid As Integer, data As Bytes)
+        Dim implicit As Boolean = Me.BeginImplicitTransaction()
+        Try
+            Me.WriteLargeObjectData(oid, data, True)
+            Me.EndImplicitTransaction(implicit, True)
+        Catch e As DatabaseException
+            Me.EndImplicitTransaction(implicit, False)
+            Throw e
+        End Try
+    End Sub
+
+    Private Sub WriteLargeObjectData(oid As Integer, data As Bytes, truncate As Boolean)
+        Dim fd As Integer = lo_open(Me.mConn, oid, INV_WRITE)
+        If fd < 0 Then
+            Throw Me.LoFailure("lo_open failed")
+        End If
+        If truncate Then
+            If lo_truncate64(Me.mConn, fd, 0) < 0 Then
+                lo_close(Me.mConn, fd)
+                Throw Me.LoFailure("lo_truncate64 failed")
+            End If
+        End If
+        Dim offset As Integer = 0
+        While offset < data.Count
+            Dim size As Integer = data.Count - offset
+            If size > PG_LO_CHUNK Then
+                size = PG_LO_CHUNK
+            End If
+            Dim written As Integer = lo_write(Me.mConn, fd, PgOffsetPtr(data.DataPtr(), offset), size)
+            If written <= 0 Then
+                lo_close(Me.mConn, fd)
+                Throw Me.LoFailure("lo_write failed")
+            End If
+            offset += written
+        Wend
+        If lo_close(Me.mConn, fd) < 0 Then
+            Throw Me.LoFailure("lo_close failed")
+        End If
+    End Sub
+
+    ''' Reads the whole of large object `oid`.
+    Public Function ReadLargeObject(oid As Integer) As Bytes
+        Dim implicit As Boolean = Me.BeginImplicitTransaction()
+        Try
+            Dim fd As Integer = lo_open(Me.mConn, oid, INV_READ)
+            If fd < 0 Then
+                Throw Me.LoFailure("lo_open failed")
+            End If
+            Dim chunk As New Bytes()
+            For i As Integer = 1 To PG_LO_CHUNK
+                chunk.Append(0)
+            Next
+            Dim items As New Bytes()
+            Dim n As Integer = lo_read(Me.mConn, fd, chunk.DataPtr(), PG_LO_CHUNK)
+            While n > 0
+                items.Append(chunk.DataPtr(), n)
+                n = lo_read(Me.mConn, fd, chunk.DataPtr(), PG_LO_CHUNK)
+            Wend
+            lo_close(Me.mConn, fd)
+            If n < 0 Then
+                Throw Me.LoFailure("lo_read failed")
+            End If
+            Me.EndImplicitTransaction(implicit, True)
+            Return items
+        Catch e As DatabaseException
+            Me.EndImplicitTransaction(implicit, False)
+            Throw e
+        End Try
+    End Function
+
+    ''' Deletes large object `oid`.
+    Public Sub DeleteLargeObject(oid As Integer)
+        Dim implicit As Boolean = Me.BeginImplicitTransaction()
+        If lo_unlink(Me.mConn, oid) < 0 Then
+            Dim e As PgException = Me.LoFailure("lo_unlink failed")
+            Me.EndImplicitTransaction(implicit, False)
+            Throw e
+        End If
+        Me.EndImplicitTransaction(implicit, True)
+    End Sub
+End Class
