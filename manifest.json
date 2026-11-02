@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "pgsql",
   "version": "0.1.0",
-  "description": "PostgreSQL backend for the stdlib Database base class with real server-side parameter binding, chunked streaming cursors, prepared statements, LISTEN/NOTIFY, COPY, large objects, query cancellation and structured SQLSTATE errors (PgDatabase/PgRowSet; Import pgsql). Bundles libpq 18 with OpenSSL.",
+  "description": "Use PostgreSQL through the Database/RowSet API",
   "libraries": [
     {
       "libName": "pq",
