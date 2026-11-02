@@ -1,4 +1,4 @@
-# Use PostgreSQL through Buoy's Database API
+# Use PostgreSQL through the Database/RowSet API
 
 A PostgreSQL backend for the stdlib `Database` base class. It replaces the
 toolchain's bundled `postgres` package where that package falls short. Install
@@ -58,8 +58,6 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 

@@ -82,9 +82,3 @@ End Sub
   targets as the toolchain's `postgres` package. Their licenses ship under
   `resources/pgsql-licenses/` and are copied next to built executables. Both
   packages can be installed side by side because the class names differ.
-
-## Verification
-
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
