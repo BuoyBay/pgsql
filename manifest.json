@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "pgsql",
   "version": "0.1.0",
-  "description": "Use PostgreSQL through the Database/RowSet API",
+  "description": "PostgreSQL Database / RowSet",
   "libraries": [
     {
       "libName": "pq",

@@ -1,4 +1,4 @@
-# Use PostgreSQL through the Database/RowSet API
+# PostgreSQL Database / RowSet
 
 A PostgreSQL backend for the stdlib `Database` base class. It replaces the
 toolchain's bundled `postgres` package where that package falls short. Install
@@ -23,7 +23,7 @@ consumer project for reproducible installs.
 
 ## Example
 
-```buoy
+```basic
 Import pgsql
 
 Sub Main()
