@@ -1,4 +1,4 @@
-# PostgreSQL Database / RowSet
+# PostgreSQL Database and RowSet
 
 A PostgreSQL backend for the stdlib `Database` base class. It replaces the
 toolchain's bundled `postgres` package where that package falls short. Install
